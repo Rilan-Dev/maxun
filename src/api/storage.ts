@@ -72,7 +72,7 @@ export const createScrapeRobot = async (
 };
 
 export const createLLMRobot = async (
-  url: string | undefined,
+  url: string,
   prompt: string,
   llmProvider?: 'anthropic' | 'openai' | 'ollama',
   llmModel?: string,
@@ -84,7 +84,7 @@ export const createLLMRobot = async (
     const response = await axios.post(
       `${apiUrl}/storage/recordings/llm`,
       {
-        url: url || undefined,
+        url,
         prompt,
         llmProvider,
         llmModel,
@@ -119,6 +119,7 @@ export const updateRecording = async (id: string, data: {
   targetUrl?: string;
   workflow?: any[];
   formats?: OutputFormats[];
+  compareRuns?: boolean;
   promptLlmProvider?: 'anthropic' | 'openai' | 'ollama';
   promptLlmModel?: string;
   promptLlmApiKey?: string;
@@ -168,6 +169,31 @@ export const getStoredRun = async (id: string): Promise<any | null> => {
     }
   } catch (error: any) {
     console.log(error);
+    return null;
+  }
+};
+
+export interface RunDiffResponse {
+  currentRunId: string;
+  previousRunId: string;
+  currentText: string;
+  previousText: string;
+  formats: Partial<Record<'text' | 'markdown' | 'html', {
+    current: string;
+    previous: string;
+  }>>;
+  capturedText: { current: string; previous: string } | null;
+  capturedLists: { current: Record<string, any>; previous: Record<string, any> } | null;
+  changedFormats: string[];
+}
+
+export const getRunDiff = async (id: string): Promise<RunDiffResponse | null> => {
+  try {
+    const response = await axios.get(`${apiUrl}/storage/runs/${id}/diff`);
+    if (response.status === 200) {return response.data;}
+    else {throw new Error(`Couldn't retrieve diff for run ${id}`);}
+  }
+  catch (error: any) {console.log(error);
     return null;
   }
 };
@@ -250,6 +276,16 @@ export const deleteRunFromStorage = async (id: string): Promise<boolean> => {
     }
   } catch (error: any) {
     console.log(error);
+    return false;
+  }
+};
+
+export const deleteAllRunsFromStorage = async (robotMetaId: string): Promise<boolean> => {
+  try {
+    const response = await axios.delete(`${apiUrl}/storage/runs/robot/${robotMetaId}`);
+    return response.status === 200 && response.data === true;
+  } catch (error: any) {
+    console.error('Error deleting runs for robot:', error);
     return false;
   }
 };
@@ -473,13 +509,21 @@ export const createDocumentExtractRobot = async (
 export const createDocumentParseRobot = async (
   file: File,
   robotName: string,
-  outputFormats: string[]
+  outputFormats: string[],
+  llmProvider?: string,
+  llmModel?: string,
+  llmApiKey?: string,
+  llmBaseUrl?: string
 ): Promise<any> => {
   try {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('name', robotName);
     outputFormats.forEach((fmt) => formData.append('formats', fmt));
+    if (llmProvider) formData.append('llmProvider', llmProvider);
+    if (llmModel) formData.append('llmModel', llmModel);
+    if (llmApiKey) formData.append('llmApiKey', llmApiKey);
+    if (llmBaseUrl) formData.append('llmBaseUrl', llmBaseUrl);
 
     const response = await axios.post(
       `${apiUrl}/storage/recordings/document-parse`,
