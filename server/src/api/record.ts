@@ -7,7 +7,6 @@ import { v4 as uuid } from "uuid";
 import { createRemoteBrowserForRun, destroyRemoteBrowser } from "../browser-management/controller";
 import logger from "../logger";
 import { browserPool, io as serverIo } from "../server";
-import { io, Socket } from "socket.io-client";
 import { BinaryOutputService } from "../storage/mino";
 import { AuthenticatedRequest } from "../routes/record"
 import {capture} from "../utils/analytics";
@@ -18,11 +17,15 @@ import { addAirtableUpdateTask, processAirtableUpdates } from "../workflow-manag
 import { sendWebhook } from "../routes/webhook";
 import { convertPageToHTML, convertPageToLinks, convertPageToMarkdown, convertPageToScreenshot, convertPageToText } from '../markdownify/scrape';
 import { safeDecrypt } from '../utils/auth';
+import { mintInternalSocketToken } from '../socket-connection/socketAuth';
 import { executeBrowserAgent } from '../sdk/browserAgent';
 import { OutputFormats } from '../constants/output-formats';
 import { processRobotOutputFormats } from '../utils/output-post-processor';
 import { addJob } from '../storage/graphileWorker';
 import { QUEUE_NAMES } from '../task-runner';
+import { computeNextRun, buildCronExpression, ScheduleValidationError } from '../utils/schedule';
+import { compareExtractRunWithPrevious, compareRunOutputsWithPrevious } from '../utils/run-comparison';
+import { withSnakeCaseCapturedKeys } from "../../../src/helpers/jsonKeys";
 
 const router = Router();
 
@@ -98,6 +101,8 @@ const formatRecording = (recordingData: any) => {
  *   get:
  *     summary: Get all robots
  *     description: Retrieve a list of all robots.
+ *     tags:
+ *       - Robots
  *     security:
  *       - api_key: []
  *     responses:
@@ -150,11 +155,7 @@ const formatRecording = (recordingData: any) => {
  */
 router.get("/robots", requireAPIKey, async (req: Request, res: Response) => {
     try {
-        const authenticatedReq = req as AuthenticatedRequest;
-        if (!authenticatedReq.user) {
-            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
-        }
-        const robots = await Robot.findAll({ where: { userId: authenticatedReq.user.id }, raw: true });
+        const robots = await Robot.findAll({ raw: true });
         const formattedRecordings = robots.map(formatRecording);
 
         const response = {
@@ -207,6 +208,8 @@ const formatRecordingById = (recordingData: any) => {
  *   get:
  *     summary: Get robot by ID
  *     description: Retrieve a robot by its ID.
+ *     tags:
+ *       - Robots
  *     security:
  *       - api_key: []
  *     parameters:
@@ -258,14 +261,9 @@ const formatRecordingById = (recordingData: any) => {
  */
 router.get("/robots/:id", requireAPIKey, async (req: Request, res: Response) => {
     try {
-        const authenticatedReq = req as AuthenticatedRequest;
-        if (!authenticatedReq.user) {
-            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
-        }
         const robot = await Robot.findOne({
             where: {
-                'recording_meta.id': req.params.id,
-                userId: authenticatedReq.user.id,
+                'recording_meta.id': req.params.id
             },
             raw: true
         });
@@ -295,6 +293,8 @@ router.get("/robots/:id", requireAPIKey, async (req: Request, res: Response) => 
  *   get:
  *     summary: Get all runs for a robot
  *     description: Retrieve all runs associated with a specific robot.
+ *     tags:
+ *       - Runs
  *     security:
  *       - api_key: []
  *     parameters:
@@ -354,14 +354,6 @@ router.get("/robots/:id", requireAPIKey, async (req: Request, res: Response) => 
  */
 router.get("/robots/:id/runs",requireAPIKey, async (req: Request, res: Response) => {
     try {
-        const authenticatedReq = req as AuthenticatedRequest;
-        if (!authenticatedReq.user) {
-            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
-        }
-        const robot = await Robot.findOne({ where: { 'recording_meta.id': req.params.id, userId: authenticatedReq.user.id } });
-        if (!robot) {
-            return res.status(404).json({ statusCode: 404, messageCode: 'not_found', message: 'Robot not found' });
-        }
         const runs = await Run.findAll({
             where: {
                 robotMetaId: req.params.id
@@ -408,6 +400,8 @@ function formatRunResponse(run: any) {
         runBySDK: run.runBySDK,
         runByMCP: run.runByMCP,
         runByCLI: run.runByCLI,
+        hasChanges: !!run.hasChanges,
+        changedFormats: run.serializableOutput?._comparison?.changedFormats || [],
         data: {
             textData: {},
             listData: {},
@@ -425,11 +419,11 @@ function formatRunResponse(run: any) {
     const output = run.serializableOutput || {};
 
     if (output.scrapeSchema && typeof output.scrapeSchema === 'object') {
-        formattedRun.data.textData = output.scrapeSchema;
+        formattedRun.data.textData = withSnakeCaseCapturedKeys(output.scrapeSchema);
     }
 
     if (output.scrapeList && typeof output.scrapeList === 'object') {
-        formattedRun.data.listData = output.scrapeList;
+        formattedRun.data.listData = withSnakeCaseCapturedKeys(output.scrapeList);
     }
 
     if (output.crawl && typeof output.crawl === 'object') {
@@ -474,6 +468,8 @@ function formatRunResponse(run: any) {
  *   get:
  *     summary: Get a specific run by ID for a robot
  *     description: Retrieve details of a specific run by its ID.
+ *     tags:
+ *       - Runs
  *     security:
  *       - api_key: []
  *     parameters:
@@ -531,14 +527,6 @@ function formatRunResponse(run: any) {
  */
 router.get("/robots/:id/runs/:runId", requireAPIKey, async (req: Request, res: Response) => {
     try {
-        const authenticatedReq = req as AuthenticatedRequest;
-        if (!authenticatedReq.user) {
-            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
-        }
-        const robot = await Robot.findOne({ where: { 'recording_meta.id': req.params.id, userId: authenticatedReq.user.id } });
-        if (!robot) {
-            return res.status(404).json({ statusCode: 404, messageCode: 'not_found', message: `Robot with ID "${req.params.id}" not found.` });
-        }
         const run = await Run.findOne({
             where: {
                 runId: req.params.runId,
@@ -568,8 +556,7 @@ async function createWorkflowAndStoreMetadata(id: string, userId: string, runSou
     try {
         const recording = await Robot.findOne({
             where: {
-                'recording_meta.id': id,
-                userId: userId,
+                'recording_meta.id': id
             },
             raw: true
         });
@@ -643,12 +630,49 @@ async function createWorkflowAndStoreMetadata(id: string, userId: string, runSou
             logger.log('warn', `Failed to send run-started notification for API run ${plainRun.runId}: ${socketError.message}`);
         }
 
-        if (isDocRobot) {
+        try {
             await addJob(QUEUE_NAMES.EXECUTE_RUN, {
                 userId,
                 runId: plainRun.runId,
                 browserId,
-            }, { maxAttempts: 1 });
+            }, {
+                maxAttempts: 1,
+                jobKey: `${QUEUE_NAMES.EXECUTE_RUN}:${plainRun.runId}`,
+            });
+        } catch (queueError: any) {
+            const finishedAt = new Date().toLocaleString();
+            await run.update({
+                status: 'failed',
+                finishedAt,
+                log: `Failed to queue execution job: ${queueError.message}`,
+            });
+
+            try {
+                serverIo.of('/queued-run').to(`user-${userId}`).emit('run-completed', {
+                    runId: plainRun.runId,
+                    robotMetaId: plainRun.robotMetaId,
+                    robotName: plainRun.name,
+                    status: 'failed',
+                    finishedAt,
+                    runByUserId: plainRun.runByUserId,
+                    runByScheduleId: plainRun.runByScheduleId,
+                    runByAPI: plainRun.runByAPI || false,
+                    browserId: plainRun.browserId,
+                    error: `Failed to queue execution job: ${queueError.message}`,
+                });
+            } catch (socketError: any) {
+                logger.log('warn', `Failed to emit queue failure for API run ${plainRun.runId}: ${socketError.message}`);
+            }
+
+            if (!isDocRobot) {
+                try {
+                    await destroyRemoteBrowser(browserId, userId);
+                } catch (cleanupError: any) {
+                    logger.log('warn', `Failed to clean up browser ${browserId} after queue error: ${cleanupError.message}`);
+                }
+            }
+
+            throw queueError;
         }
 
         return {
@@ -701,36 +725,6 @@ async function triggerIntegrationUpdates(runId: string, robotMetaId: string): Pr
   } catch (err: any) {
     logger.log('error', `Failed to update integrations for run: ${runId}: ${err.message}`);
   }
-}
-
-async function readyForRunHandler(browserId: string, id: string, userId: string, socket: Socket) {
-    try {
-        const result = await executeRun(id, userId);
-
-        if (result && result.success) {
-            logger.log('info', `Interpretation of ${id} succeeded`);
-            resetRecordingState(browserId, id);
-            return result.interpretationInfo;
-        } else {
-            logger.log('error', `Interpretation of ${id} failed`);
-            await destroyRemoteBrowser(browserId, userId);
-            resetRecordingState(browserId, id);
-            return null;
-        }
-
-    } catch (error: any) {
-        logger.error(`Error during readyForRunHandler: ${error.message}`);
-        await destroyRemoteBrowser(browserId, userId);
-        return null;
-    } finally {
-        cleanupSocketConnection(socket, browserId, id);
-    }
-}
-
-
-function resetRecordingState(browserId: string, id: string) {
-    browserId = '';
-    id = '';
 }
 
 function AddGeneratedFlags(workflow: WorkflowFile) {
@@ -972,20 +966,34 @@ async function executeRun(id: string, userId: string) {
                     }
                 }
 
-                await run.update({
-                    status: 'success',
-                    finishedAt: new Date().toLocaleString(),
-                    log: `${formats.join(', ')} conversion completed successfully`,
-                    serializableOutput,
-                    binaryOutput,
-                });
-
+                const finishedAt = new Date().toLocaleString();
+                let hasChanges = false;
+                const binaryOutputService = new BinaryOutputService('maxun-run-screenshots');
+                if ((recording.recording_meta as any).compareRuns) {
+                    capture('maxun-oss-monitoring-used', { robotType: 'scrape', source: 'api' });
+                    try {
+                        const comparison = await compareRunOutputsWithPrevious(run, serializableOutput);
+                        hasChanges = comparison.hasChanges;
+                        serializableOutput._comparison = {
+                            changedFormats: comparison.changedFormats,
+                        };
+                    } catch (comparisonError: any) {
+                        logger.warn(`Monitoring comparison failed for API scrape run ${plainRun.runId}: ${comparisonError.message}`);
+                    }
+                }
                 let uploadedBinaryOutput: Record<string, string> = {};
                 if (Object.keys(binaryOutput).length > 0) {
-                    const binaryOutputService = new BinaryOutputService('maxun-run-screenshots');
                     uploadedBinaryOutput = await binaryOutputService.uploadAndStoreBinaryOutput(run, binaryOutput);
-                    await run.update({ binaryOutput: uploadedBinaryOutput });
                 }
+
+                await run.update({
+                    status: 'success',
+                    finishedAt,
+                    log: `${formats.join(', ')} conversion completed successfully`,
+                    serializableOutput,
+                    binaryOutput: uploadedBinaryOutput,
+                    hasChanges,
+                });
 
                 logger.log('info', `Markdown robot execution completed for API run ${id}`);
 
@@ -995,7 +1003,8 @@ async function executeRun(id: string, userId: string) {
                         robotMetaId: plainRun.robotMetaId,
                         robotName: recording.recording_meta.name,
                         status: 'success',
-                        finishedAt: new Date().toLocaleString()
+                        finishedAt,
+                        hasChanges,
                     };
 
                     serverIo
@@ -1184,7 +1193,26 @@ async function executeRun(id: string, userId: string) {
             }
         }
 
+        const finalSerializableOutput: any = {
+            ...(finalRun?.serializableOutput || {}),
+            crawl: categorizedOutput.crawl,
+            search: categorizedOutput.search,
+        };
+
         const binaryOutputService = new BinaryOutputService('maxun-run-screenshots');
+        let hasChanges = false;
+        if (robotType === 'extract' && (recording.recording_meta as any).compareRuns) {
+            capture('maxun-oss-monitoring-used', { robotType: 'extract', source: 'api' });
+            try {
+                const comparison = await compareExtractRunWithPrevious(run, finalSerializableOutput);
+                hasChanges = comparison.hasChanges;
+                finalSerializableOutput._comparison = {
+                    changedFormats: comparison.changedFormats,
+                };
+            } catch (comparisonError: any) {
+                logger.warn(`Monitoring comparison failed for API extract run ${plainRun.runId}: ${comparisonError.message}`);
+            }
+        }
         const uploadedBinaryOutput = await binaryOutputService.uploadAndStoreBinaryOutput(run, postBinaryOutput);
 
         if (browser && browser.interpreter) {
@@ -1197,6 +1225,8 @@ async function executeRun(id: string, userId: string) {
             finishedAt: new Date().toLocaleString(),
             log: interpretationInfo.log.join('\n'),
             binaryOutput: uploadedBinaryOutput,
+            serializableOutput: finalSerializableOutput,
+            hasChanges,
         });
 
         try {
@@ -1209,6 +1239,7 @@ async function executeRun(id: string, userId: string) {
                 runByUserId: plainRun.runByUserId,
                 runByScheduleId: plainRun.runByScheduleId,
                 runByAPI: plainRun.runByAPI || false,
+                hasChanges,
                 browserId: plainRun.browserId
             };
 
@@ -1415,11 +1446,9 @@ async function executeRun(id: string, userId: string) {
 }
 
 export async function handleRunRecording(id: string, userId: string, runSource: 'api' | 'sdk' | 'mcp' | 'cli' = 'api', requestedFormats?: OutputFormats[], promptInstructions?: string) {
-    let socket: Socket | null = null;
-
     try {
         const result = await createWorkflowAndStoreMetadata(id, userId, runSource, requestedFormats, promptInstructions);
-        const { browserId, runId: newRunId, isDocRobot } = result as any;
+        const { runId: newRunId, isDocRobot } = result as any;
 
         if (!newRunId || !userId) {
             throw new Error('runId or userId is undefined');
@@ -1427,37 +1456,7 @@ export async function handleRunRecording(id: string, userId: string, runSource: 
 
         if (isDocRobot) {
             logger.log('info', `Doc robot run ${newRunId} queued without browser`);
-            return newRunId;
         }
-
-        if (!browserId) {
-            throw new Error('browserId is undefined for non-document robot');
-        }
-
-        const CONNECTION_TIMEOUT = 30000;
-
-        socket = io(`${process.env.BACKEND_URL ? process.env.BACKEND_URL : 'http://localhost:8080'}/${browserId}`, {
-            transports: ['websocket'],
-            rejectUnauthorized: false,
-            timeout: CONNECTION_TIMEOUT,
-        });
-
-        const readyHandler = () => readyForRunHandler(browserId, newRunId, userId, socket!);
-
-        socket.on('ready-for-run', readyHandler);
-
-        socket.on('connect_error', (error: Error) => {
-            logger.error(`Socket connection error for API run ${newRunId}: ${error.message}`);
-            cleanupSocketConnection(socket!, browserId, newRunId);
-        });
-
-        socket.on('error', (error: Error) => {
-            logger.error(`Socket error for API run ${newRunId}: ${error.message}`);
-        });
-
-        socket.on('disconnect', () => {
-            cleanupSocketConnection(socket!, browserId, newRunId);
-        });
 
         logger.log('info', `Running Robot: ${id}`);
 
@@ -1465,31 +1464,6 @@ export async function handleRunRecording(id: string, userId: string, runSource: 
 
     } catch (error: any) {
         logger.error('Error running robot:', error);
-        if (socket) {
-            cleanupSocketConnection(socket, '', '');
-        }
-    }
-}
-
-function cleanupSocketConnection(socket: Socket, browserId: string, id: string) {
-    try {
-        socket.removeAllListeners();
-        socket.disconnect();
-
-        if (browserId) {
-            const namespace = serverIo.of(browserId);
-            namespace.removeAllListeners();
-            namespace.disconnectSockets(true);
-            const nsps = (serverIo as any)._nsps;
-            if (nsps && nsps.has(`/${browserId}`)) {
-                nsps.delete(`/${browserId}`);
-                logger.log('debug', `Deleted namespace /${browserId} from io._nsps Map`);
-            }
-        }
-
-        logger.log('info', `Cleaned up socket connection for browserId: ${browserId}, runId: ${id}`);
-    } catch (error: any) {
-        logger.error(`Error cleaning up socket connection: ${error.message}`);
     }
 }
 
@@ -1523,6 +1497,8 @@ async function waitForRunCompletion(runId: string, interval: number = 2000) {
  *   post:
  *     summary: Run a robot by ID
  *     description: When you need to run a robot and get its captured data, you can use this endpoint to create a run for the robot. For now, you can poll the GET endpoint to retrieve a run's details as soon as it is finished. We are working on adding a webhook feature to notify you when a run is finished.
+ *     tags:
+ *       - Runs 
  *     security:
  *       - api_key: []
  *     parameters:
@@ -1639,6 +1615,8 @@ router.post("/robots/:id/runs", requireAPIKey, async (req: AuthenticatedRequest,
  *   post:
  *     summary: Duplicate a robot with a new target URL
  *     description: Duplicate an existing robot to run it on a different URL with the same structure.
+ *    tags: 
+ *     - Robots   
  *     security:
  *       - api_key: []
  *     parameters:
@@ -1673,10 +1651,6 @@ router.post("/robots/:id/runs", requireAPIKey, async (req: AuthenticatedRequest,
  */
 router.post("/robots/:id/duplicate", requireAPIKey, async (req: Request, res: Response) => {
     try {
-        const authenticatedReq = req as AuthenticatedRequest;
-        if (!authenticatedReq.user) {
-            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
-        }
         const { id } = req.params;
         const { targetUrl } = req.body;
 
@@ -1700,7 +1674,7 @@ router.post("/robots/:id/duplicate", requireAPIKey, async (req: Request, res: Re
         }
 
         const originalRobot = await Robot.findOne({
-            where: { 'recording_meta.id': id, userId: authenticatedReq.user!.id },
+            where: { 'recording_meta.id': id },
         });
 
         if (!originalRobot) {
@@ -1791,6 +1765,290 @@ router.post("/robots/:id/duplicate", requireAPIKey, async (req: Request, res: Re
             statusCode: 500,
             messageCode: "error",
             message: error instanceof Error ? error.message : 'An unknown error occurred.',
+        });
+    }
+});
+
+/**
+ * @swagger
+ * /api/robots/{id}/schedule:
+ *   post:
+ *     summary: Schedule recurring runs for a robot
+ *     description: Create or replace a recurring schedule for a robot. The robot will run automatically based on the provided frequency. Re-posting replaces any existing schedule.
+ *     tags:
+ *      - Schedule
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot to schedule.
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             type: object
+ *             required:
+ *               - runEvery
+ *               - runEveryUnit
+ *               - startFrom
+ *               - atTimeStart
+ *               - atTimeEnd
+ *               - timezone
+ *             properties:
+ *               runEvery:
+ *                 type: integer
+ *                 example: 6
+ *                 description: How often the robot runs, in units of runEveryUnit.
+ *               runEveryUnit:
+ *                 type: string
+ *                 enum: [MINUTES, HOURS, DAYS, WEEKS, MONTHS]
+ *                 example: HOURS
+ *               startFrom:
+ *                 type: string
+ *                 enum: [SUNDAY, MONDAY, TUESDAY, WEDNESDAY, THURSDAY, FRIDAY, SATURDAY]
+ *                 example: MONDAY
+ *               atTimeStart:
+ *                 type: string
+ *                 example: "09:00"
+ *                 description: Start time in HH:MM (24h).
+ *               atTimeEnd:
+ *                 type: string
+ *                 example: "17:00"
+ *                 description: End time in HH:MM (24h).
+ *               timezone:
+ *                 type: string
+ *                 example: "UTC"
+ *                 description: IANA timezone name.
+ *               dayOfMonth:
+ *                 type: string
+ *                 example: "1"
+ *                 description: Day of month (only used when runEveryUnit is MONTHS).
+ *     responses:
+ *       200:
+ *         description: Schedule created successfully.
+ *       400:
+ *         description: Invalid schedule parameters.
+ *       401:
+ *         description: Unauthorized access.
+ *       404:
+ *         description: Robot not found.
+ *       500:
+ *         description: Error scheduling robot.
+ */
+router.post("/robots/:id/schedule", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const authenticatedReq = req as AuthenticatedRequest;
+        if (!authenticatedReq.user) {
+            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
+        }
+
+        const { id } = req.params;
+
+        const robot = await Robot.findOne({ where: { 'recording_meta.id': id } });
+        if (!robot) {
+            return res.status(404).json({
+                statusCode: 404,
+                messageCode: "not_found",
+                message: `Robot with ID "${id}" not found.`,
+            });
+        }
+
+        const { runEvery, runEveryUnit, startFrom, dayOfMonth, atTimeStart, atTimeEnd, timezone } = req.body;
+
+        // Validate inputs and build the cron expression (shared with the dashboard route).
+        let cronExpression: string;
+        try {
+            ({ cronExpression } = buildCronExpression({
+                runEvery, runEveryUnit, startFrom, atTimeStart, atTimeEnd, timezone, dayOfMonth,
+            }));
+        } catch (validationError) {
+            if (validationError instanceof ScheduleValidationError) {
+                return res.status(400).json({
+                    statusCode: 400,
+                    messageCode: "bad_request",
+                    message: validationError.message,
+                    field: validationError.field,
+                });
+            }
+            throw validationError;
+        }
+
+        const nextRunAt = computeNextRun(cronExpression, timezone);
+
+        // Single scoped update. No schedulerClaimedAt key => any stale claim is cleared.
+        await robot.update({
+            schedule: {
+                runEvery,
+                runEveryUnit,
+                startFrom,
+                dayOfMonth,
+                atTimeStart,
+                atTimeEnd,
+                timezone,
+                cronExpression,
+                lastRunAt: undefined,
+                nextRunAt: nextRunAt || undefined,
+            },
+        });
+
+        capture('maxun-oss-robot-scheduled', {
+            robotId: id,
+            user_id: authenticatedReq.user.id,
+            source: 'api',
+            scheduled_at: new Date().toISOString(),
+        });
+
+        logger.log('info', `Scheduled robot ${id} via API (cron: ${cronExpression}, tz: ${timezone}, next: ${nextRunAt})`);
+
+        const updatedRobot = await Robot.findOne({ where: { 'recording_meta.id': id }, raw: true });
+
+        return res.status(200).json({
+            statusCode: 200,
+            messageCode: "success",
+            schedule: updatedRobot?.schedule ?? null,
+        });
+    } catch (error) {
+        logger.log('error', `Error scheduling robot with ID ${req.params.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to schedule robot",
+        });
+    }
+});
+
+/**
+ * @swagger
+ * /api/robots/{id}/schedule:
+ *   get:
+ *     summary: Get a robot's schedule
+ *     description: Retrieve the current recurring schedule for a robot, or null if none is set.
+ *     tags: 
+ *      - Schedule
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot.
+ *     responses:
+ *       200:
+ *         description: The robot's schedule (or null).
+ *       401:
+ *         description: Unauthorized access.
+ *       404:
+ *         description: Robot not found.
+ *       500:
+ *         description: Error retrieving schedule.
+ */
+router.get("/robots/:id/schedule", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const authenticatedReq = req as AuthenticatedRequest;
+        if (!authenticatedReq.user) {
+            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
+        }
+
+        const { id } = req.params;
+
+        const robot = await Robot.findOne({ where: { 'recording_meta.id': id }, raw: true });
+        if (!robot) {
+            return res.status(404).json({
+                statusCode: 404,
+                messageCode: "not_found",
+                message: `Robot with ID "${id}" not found.`,
+            });
+        }
+
+        return res.status(200).json({
+            statusCode: 200,
+            messageCode: "success",
+            schedule: robot.schedule ?? null,
+        });
+    } catch (error) {
+        logger.log('error', `Error fetching schedule for robot with ID ${req.params.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to retrieve schedule",
+        });
+    }
+});
+
+/**
+ * @swagger
+ * /api/robots/{id}/schedule:
+ *   delete:
+ *     summary: Delete a robot's schedule
+ *     description: Cancel a robot's recurring schedule. Idempotent — succeeds even if the robot has no schedule.
+ *     tags:
+ *       - Schedule
+ *     security:
+ *       - api_key: []
+ *     parameters:
+ *       - in: path
+ *         name: id
+ *         schema:
+ *           type: string
+ *         required: true
+ *         description: The ID of the robot.
+ *     responses:
+ *       200:
+ *         description: Schedule deleted successfully.
+ *       401:
+ *         description: Unauthorized access.
+ *       404:
+ *         description: Robot not found.
+ *       500:
+ *         description: Error deleting schedule.
+ */
+router.delete("/robots/:id/schedule", requireAPIKey, async (req: Request, res: Response) => {
+    try {
+        const authenticatedReq = req as AuthenticatedRequest;
+        if (!authenticatedReq.user) {
+            return res.status(401).json({ statusCode: 401, messageCode: 'error', message: 'Unauthorized' });
+        }
+
+        const { id } = req.params;
+
+        const robot = await Robot.findOne({ where: { 'recording_meta.id': id } });
+        if (!robot) {
+            return res.status(404).json({
+                statusCode: 404,
+                messageCode: "not_found",
+                message: `Robot with ID "${id}" not found.`,
+            });
+        }
+
+        await robot.update({ schedule: null });
+
+        capture('maxun-oss-robot-schedule-deleted', {
+            robotId: id,
+            user_id: authenticatedReq.user.id,
+            source: 'api',
+            unscheduled_at: new Date().toISOString(),
+        });
+
+        logger.log('info', `Deleted schedule for robot ${id} via API`);
+
+        return res.status(200).json({
+            statusCode: 200,
+            messageCode: "success",
+            message: "Schedule deleted successfully",
+        });
+    } catch (error) {
+        logger.log('error', `Error deleting schedule for robot with ID ${req.params.id}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+        return res.status(500).json({
+            statusCode: 500,
+            messageCode: "error",
+            message: "Failed to delete schedule",
         });
     }
 });

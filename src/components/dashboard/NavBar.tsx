@@ -24,7 +24,8 @@ import {
   Close,
   LightMode,
   DarkMode,
-  Translate
+  Translate,
+  RssFeed
 } from "@mui/icons-material";
 import { useNavigate } from 'react-router-dom';
 import { AuthContext } from '../../context/auth';
@@ -133,6 +134,8 @@ export const NavBar: React.FC<NavBarProps> = ({
   const changeLanguage = (lang: string) => {
     i18n.changeLanguage(lang);
     localStorage.setItem("language", lang);
+    // Document direction (RTL for Hebrew) is handled centrally in src/i18n.ts
+    // via the i18n 'languageChanged' listener.
   };
 
   const renderThemeToggle = () => (
@@ -214,8 +217,8 @@ export const NavBar: React.FC<NavBarProps> = ({
           cursor: 'pointer'
         }}
           onClick={() => navigate('/')}>
-          <img src={MaxunLogo} width={46} height={39} style={{ borderRadius: '5px', margin: '5px 0px 5px 15px' }} />
-          <div style={{ padding: '11px' }}><ProjectName mode={darkMode ? 'dark' : 'light'}>{t('navbar.project_name')}</ProjectName></div>
+          <img src={MaxunLogo} width={52} height={45} style={{ borderRadius: '5px', margin: '5px 0px 5px 8px' }} />
+          <div style={{ padding: '13px' }}><ProjectName mode={darkMode ? 'dark' : 'light'}>{t('navbar.project_name')}</ProjectName></div>
           <Chip
             label={`${currentVersion}`}
             color="primary"
@@ -229,19 +232,6 @@ export const NavBar: React.FC<NavBarProps> = ({
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end' }}>
               {!isRecording ? (
                 <>
-                  <IconButton href="https://maxun.dev/autorobots" target="_blank" sx={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    borderRadius: '5px',
-                    padding: '8px',
-                    marginRight: '20px',
-                    '&:hover': {
-                      background: 'inherit',
-                      color: darkMode ? '#ffffff' : '#0000008A',
-                    }
-                  }}>
-                    <Typography variant="body1">Browse Auto Robots</Typography>
-                  </IconButton>
                   <IconButton onClick={handleMenuOpen} sx={{
                     display: 'flex',
                     alignItems: 'center',
@@ -295,6 +285,11 @@ export const NavBar: React.FC<NavBarProps> = ({
                       window.open('https://x.com/MaxunHQ?ref=app', '_blank');
                     }}>
                       <X sx={{ marginRight: '5px' }} /> Twitter (X)
+                    </MenuItem>
+                    <MenuItem onClick={() => {
+                      window.open('https://www.maxun.dev/blog', '_blank');
+                    }}>
+                      <RssFeed sx={{ marginRight: '5px' }} /> Blog
                     </MenuItem>
                     <Menu
                       anchorEl={langAnchorEl}
@@ -364,6 +359,22 @@ export const NavBar: React.FC<NavBarProps> = ({
                         }}
                       >
                         한국어
+                      </MenuItem>
+                      <MenuItem
+                        onClick={() => {
+                          changeLanguage("he");
+                          handleMenuClose();
+                        }}
+                      >
+                        עברית
+                      </MenuItem>
+                      <MenuItem
+                        onClick={() => {
+                          changeLanguage("az");
+                          handleMenuClose();
+                        }}
+                      >
+                        Azərbaycan dili
                       </MenuItem>
                       <MenuItem
                         onClick={() => {
@@ -476,6 +487,22 @@ export const NavBar: React.FC<NavBarProps> = ({
                   }}
                 >
                   한국어
+                </MenuItem>
+                <MenuItem
+                  onClick={() => {
+                    changeLanguage("he");
+                    handleMenuClose();
+                  }}
+                >
+                  עברית
+                </MenuItem>
+                <MenuItem
+                  onClick={() => {
+                    changeLanguage("az");
+                    handleMenuClose();
+                  }}
+                >
+                  Azərbaycan dili
                 </MenuItem>
                 <MenuItem
                   onClick={() => {

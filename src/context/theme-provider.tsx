@@ -1,7 +1,50 @@
-import React, { createContext, useContext, useState, useEffect } from 'react';
+import React, { createContext, useContext, useState, useEffect, useMemo } from 'react';
 import { ThemeProvider, createTheme } from '@mui/material/styles';
 import CssBaseline from '@mui/material/CssBaseline';
+import i18n, { isRtlLanguage } from '../i18n';
 
+const sharedInputOverrides = {
+  MuiButtonBase: {
+    defaultProps: {
+      disableRipple: true,
+    },
+  },
+  MuiCheckbox: {
+    defaultProps: {
+      disableRipple: true,
+    },
+  },
+  MuiInputLabel: {
+    defaultProps: {
+      shrink: true,
+    },
+    styleOverrides: {
+      root: {
+        position: 'relative',
+        transform: 'none',
+        marginBottom: 6,
+        fontSize: '0.875rem',
+        textAlign: 'left',
+        '& .MuiFormLabel-asterisk': {
+          display: 'none',
+        },
+      },
+    },
+  },
+  MuiOutlinedInput: {
+    styleOverrides: {
+      notchedOutline: {
+        '& legend': {
+          width: 0,
+        },
+      },
+      input: {
+        paddingTop: 10,
+        paddingBottom: 10,
+      },
+    },
+  },
+} as const;
 
 const lightTheme = createTheme({
   palette: {
@@ -11,6 +54,7 @@ const lightTheme = createTheme({
     },
   },
   components: {
+    ...sharedInputOverrides,
     MuiTableContainer: {
       styleOverrides: {
         root: {
@@ -80,6 +124,9 @@ const lightTheme = createTheme({
           textTransform: "none",
         },
       },
+      defaultProps: {
+        disableRipple: true,
+      },
     },
     MuiAlert: {
       styleOverrides: {
@@ -144,6 +191,7 @@ const darkTheme = createTheme({
     },
   },
   components: {
+    ...sharedInputOverrides,
     MuiTableContainer: {
       styleOverrides: {
         root: {
@@ -240,6 +288,9 @@ const darkTheme = createTheme({
             color: '#ff00c3',
           },
         },
+      },
+      defaultProps: {
+        disableRipple: true,
       },
     },
     MuiAlert: {
@@ -350,14 +401,37 @@ const ThemeModeProvider = ({ children }: { children: React.ReactNode }) => {
     });
   };
 
+  const [direction, setDirection] = useState<'ltr' | 'rtl'>(() =>
+    isRtlLanguage() ? 'rtl' : 'ltr'
+  );
+
   useEffect(() => {
     localStorage.setItem('darkMode', JSON.stringify(darkMode)); // Save initial mode
   }, [darkMode]);
 
+  // Language is resolved asynchronously (http backend), so follow it instead of
+  // reading it once on mount.
+  useEffect(() => {
+    const handleLanguageChanged = (lng: string) =>
+      setDirection(isRtlLanguage(lng) ? 'rtl' : 'ltr');
+
+    i18n.on('languageChanged', handleLanguageChanged);
+    return () => {
+      i18n.off('languageChanged', handleLanguageChanged);
+    };
+  }, []);
+
+  // Merge the direction into the base theme so MUI components (Drawer, Menu,
+  // Tabs, Slider...) lay themselves out RTL-aware.
+  const theme = useMemo(
+    () => createTheme(darkMode ? darkTheme : lightTheme, { direction }),
+    [darkMode, direction]
+  );
+
   return (
     <ThemeModeContext.Provider value={{ toggleTheme, darkMode }}>
-      <ThemeProvider theme={darkMode ? darkTheme : lightTheme}>
-        <CssBaseline />
+      <ThemeProvider theme={theme}>
+        <CssBaseline enableColorScheme />
         {children}
       </ThemeProvider>
     </ThemeModeContext.Provider>

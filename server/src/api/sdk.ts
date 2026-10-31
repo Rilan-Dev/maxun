@@ -26,6 +26,23 @@ import {
 } from '../constants/output-formats';
 import sequelizeInstance from '../storage/db';
 import { Op } from 'sequelize';
+import { checkAiExtractInput } from '../sdk/aiExtract/target';
+import { normalizeRobotUrl, normalizeWorkflowUrls, applyWorkflowLimits } from '../utils/robot-updates';
+import { validateRequiredLlmConfig, formatsRequireLlm, readLlmConfig, toPromptLlmMeta } from '../utils/llm-config-validation';
+import multer from 'multer';
+import { MAX_FILE_SIZE_BYTES } from '../workflow-management/classes/DocumentInterpreter';
+import { createDocumentRobotRecord } from '../utils/document/createDocumentRobotRecord';
+import { createDocumentParseRobotRecord } from '../utils/document/createDocumentParseRobotRecord';
+import { normalizeDocumentMimeType, PDF_MIME_TYPE } from '../utils/document/documentFile';
+import { diffLines } from 'diff';
+import {
+    compareExtractRunWithPrevious,
+    compareRunOutputsWithPrevious,
+    findPreviousSuccessfulRun,
+    serializeCapturedLists,
+    serializeCapturedText,
+} from '../utils/run-comparison';
+import { withSnakeCaseCapturedKeys, withSnakeCaseKeys, withSnakeCaseOutput } from "../../../src/helpers/jsonKeys";
 
 const router = Router();
 
@@ -65,79 +82,9 @@ const normalizeUrl = (raw: string): string => {
     }
 };
 
-const normalizeRobotUrl = (rawUrl: string): string => {
-    let normalizedUrl: URL;
-    try {
-        normalizedUrl = new URL(rawUrl.trim());
-    } catch {
-        throw new Error(`"${rawUrl.trim()}" is not a valid URL. Provide a full web address like https://example.com`);
-    }
-    if (!['http:', 'https:'].includes(normalizedUrl.protocol)) {
-        throw new Error(`Unsupported URL protocol "${normalizedUrl.protocol}//" — only http and https are supported. Local file paths cannot be scraped.`);
-    }
 
-    const hostname = normalizedUrl.hostname;
-    const isPlausibleHost = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i.test(hostname)
-        || hostname === 'localhost'
-        || /^\d{1,3}(\.\d{1,3}){3}$/.test(hostname)
-        || /^\[[0-9a-f:]+\]$/i.test(hostname);
-    if (!isPlausibleHost) {
-        throw new Error(`"${hostname}" is not a reachable hostname. Provide a full web address like https://example.com`);
-    }
 
-    normalizedUrl.search = normalizedUrl.searchParams.toString();
-    return normalizedUrl.toString();
-};
 
-const normalizeWorkflowUrls = (workflow: any[] = []): any[] =>
-    workflow.map((pair: any) => ({
-        ...pair,
-        where: pair?.where
-            ? {
-                ...pair.where,
-                ...(typeof pair.where.url === 'string' && pair.where.url !== 'about:blank'
-                    ? { url: normalizeRobotUrl(pair.where.url) }
-                    : {}),
-            }
-            : pair?.where,
-        what: Array.isArray(pair?.what)
-            ? pair.what.map((action: any) => {
-                if (
-                    action.action === 'goto' &&
-                    Array.isArray(action.args) &&
-                    typeof action.args[0] === 'string' &&
-                    action.args[0] !== 'about:blank'
-                ) {
-                    return {
-                        ...action,
-                        args: [normalizeRobotUrl(action.args[0]), ...action.args.slice(1)],
-                    };
-                }
-
-                if (
-                    (action.action === 'scrape' || action.action === 'crawl') &&
-                    Array.isArray(action.args) &&
-                    action.args[0] &&
-                    typeof action.args[0] === 'object' &&
-                    typeof action.args[0].url === 'string' &&
-                    action.args[0].url !== 'about:blank'
-                ) {
-                    return {
-                        ...action,
-                        args: [
-                            {
-                                ...action.args[0],
-                                url: normalizeRobotUrl(action.args[0].url),
-                            },
-                            ...action.args.slice(1),
-                        ],
-                    };
-                }
-
-                return action;
-            })
-            : pair?.what,
-    }));
 
 /**
  * Get the status of the authenticated user
@@ -231,6 +178,10 @@ router.post("/sdk/robots", requireAPIKey, async (req: AuthenticatedRequest, res:
         }
 
         const rawFormats = (workflowFile.meta as any).formats;
+        const compareRuns = (workflowFile.meta as any).compareRuns;
+        if (compareRuns !== undefined && typeof compareRuns !== 'boolean') {
+            return res.status(400).json({ error: 'meta.compareRuns must be a boolean' });
+        }
         const { validFormats, invalidFormats } = parseOutputFormats(
             rawFormats,
             type === 'scrape' ? SCRAPE_OUTPUT_FORMAT_OPTIONS : undefined
@@ -270,8 +221,9 @@ router.post("/sdk/robots", requireAPIKey, async (req: AuthenticatedRequest, res:
             const sameFormats = type === 'scrape'
                 ? JSON.stringify([...(meta.formats || [])].sort()) === JSON.stringify([...((workflowFile.meta as any).formats || ['markdown'])].sort())
                 : true;
+            const sameMonitoring = Boolean(meta.compareRuns) === Boolean(compareRuns);
 
-            if (sameType && sameUrl && sameFormats) {
+            if (sameType && sameUrl && sameFormats && sameMonitoring) {
                 return res.status(200).json({
                     data: existingRobot,
                     message: "Existing robot returned",
@@ -287,6 +239,22 @@ router.post("/sdk/robots", requireAPIKey, async (req: AuthenticatedRequest, res:
             ? ((workflowFile.meta as any).promptInstructions || (workflowFile.meta as any).smartQueries || (workflowFile.meta as any).smart_queries) as string | undefined
             : undefined;
 
+        const robotLlmConfig = readLlmConfig(workflowFile.meta);
+        const needsLlmForSummary = formatsRequireLlm(normalizedFormats);
+        const needsLlmForSmartQuery = Boolean(promptInstructionsForMeta);
+        if (needsLlmForSummary || needsLlmForSmartQuery) {
+            const reason = needsLlmForSummary && needsLlmForSmartQuery
+                ? 'The "summary" output format and Smart Query'
+                : needsLlmForSummary
+                    ? 'The "summary" output format'
+                    : 'Smart Query (promptInstructions)';
+
+            const llmValidationError = validateRequiredLlmConfig(robotLlmConfig, reason);
+            if (llmValidationError) {
+                return res.status(400).json(llmValidationError);
+            }
+        }
+
         const robotMeta: any = {
             name: workflowFile.meta.name,
             id: metaId,
@@ -297,12 +265,10 @@ router.post("/sdk/robots", requireAPIKey, async (req: AuthenticatedRequest, res:
             type,
             url: extractedUrl,
             formats: normalizedFormats,
+            ...(compareRuns !== undefined ? { compareRuns } : {}),
             isLLM: (workflowFile.meta as any).isLLM,
             ...(promptInstructionsForMeta ? { promptInstructions: promptInstructionsForMeta } : {}),
-            ...((workflowFile.meta as any).promptLlmProvider ? { promptLlmProvider: (workflowFile.meta as any).promptLlmProvider } : {}),
-            ...((workflowFile.meta as any).promptLlmModel ? { promptLlmModel: (workflowFile.meta as any).promptLlmModel } : {}),
-            ...((workflowFile.meta as any).promptLlmApiKey ? { promptLlmApiKey: encrypt((workflowFile.meta as any).promptLlmApiKey) } : {}),
-            ...((workflowFile.meta as any).promptLlmBaseUrl ? { promptLlmBaseUrl: (workflowFile.meta as any).promptLlmBaseUrl } : {}),
+            ...toPromptLlmMeta(robotLlmConfig, encrypt),
         };
 
         const robot = await Robot.create({
@@ -346,10 +312,7 @@ router.post("/sdk/robots", requireAPIKey, async (req: AuthenticatedRequest, res:
  */
 router.get("/sdk/robots", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
-        const robots = await Robot.findAll({ where: { userId: req.user.id } });
+        const robots = await Robot.findAll();
 
         return res.status(200).json({
             data: robots
@@ -369,15 +332,11 @@ router.get("/sdk/robots", requireAPIKey, async (req: AuthenticatedRequest, res: 
  */
 router.get("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
         const robotId = req.params.id;
 
         const robot = await Robot.findOne({
             where: {
-                'recording_meta.id': robotId,
-                userId: req.user.id,
+                'recording_meta.id': robotId
             }
         });
 
@@ -405,16 +364,12 @@ router.get("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, r
  */
 router.put("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
         const robotId = req.params.id;
         const updates = req.body;
 
         const robot = await Robot.findOne({
             where: {
-                'recording_meta.id': robotId,
-                userId: req.user.id,
+                'recording_meta.id': robotId
             }
         });
 
@@ -426,17 +381,27 @@ router.put("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, r
 
         const updateData: any = {};
 
-        if (updates.workflow) {
-            try {
-                updateData.recording = {
-                    workflow: normalizeWorkflowUrls(updates.workflow)
-                };
-            } catch {
-                return res.status(400).json({ error: "Invalid URL in workflow" });
-            }
+        /**
+         * A single working copy of the workflow. A request may replace the
+         * workflow wholesale, patch individual values such as `limits`, or do
+         * both, so every block below edits this one array, and it is written
+         * back to `updateData` once at the end.
+         */
+        let workflow: any[];
+        try {
+            workflow = updates.workflow
+                ? normalizeWorkflowUrls(updates.workflow)
+                : JSON.parse(JSON.stringify(robot.recording?.workflow || []));
+        } catch {
+            return res.status(400).json({ error: "Invalid URL in workflow" });
         }
 
+        let workflowTouched = Boolean(updates.workflow);
+
         if (updates.meta) {
+            if (updates.meta.compareRuns !== undefined && typeof updates.meta.compareRuns !== 'boolean') {
+                return res.status(400).json({ error: 'meta.compareRuns must be a boolean' });
+            }
             let normalizedMetaUrl: string | undefined;
             if (updates.meta.url) {
                 try {
@@ -448,12 +413,6 @@ router.put("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, r
                 }
             }
 
-            let workflow: any[];
-            try {
-                workflow = updates.workflow ? normalizeWorkflowUrls(updates.workflow) : JSON.parse(JSON.stringify(robot.recording?.workflow || []));
-            } catch {
-                return res.status(400).json({ error: "Invalid URL in workflow" });
-            }
             if (normalizedMetaUrl) {
                 workflow.forEach((pair: any) => {
                     let stepUpdate = false;
@@ -471,7 +430,7 @@ router.put("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, r
                         pair.where.url = normalizedMetaUrl;
                     }
                 });
-                updateData.recording = { workflow };
+                workflowTouched = true;
             }
 
             updateData.recording_meta = {
@@ -480,6 +439,27 @@ router.put("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, r
                 ...(normalizedMetaUrl ? { url: normalizedMetaUrl } : {}),
                 updatedAt: new Date().toISOString()
             };
+        }
+
+        /**
+         * Targeted limit updates, addressed by position in the workflow. Runs
+         * after the workflow and meta blocks so the value the caller asked for
+         * survives whatever those wrote. Anything not named here keeps the
+         * value it already had.
+         */
+        if (Array.isArray(updates.limits) && updates.limits.length > 0) {
+            try {
+                applyWorkflowLimits(workflow, updates.limits);
+                workflowTouched = true;
+            } catch (error) {
+                return res.status(400).json({
+                    error: error instanceof Error ? error.message : 'Invalid limit update',
+                });
+            }
+        }
+
+        if (workflowTouched) {
+            updateData.recording = { ...robot.recording, workflow };
         }
 
         if (updates.google_sheet_email !== undefined) {
@@ -640,15 +620,11 @@ router.put("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, r
  */
 router.delete("/sdk/robots/:id", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
         const robotId = req.params.id;
 
         const robot = await Robot.findOne({
             where: {
-                'recording_meta.id': robotId,
-                userId: req.user.id,
+                'recording_meta.id': robotId
             }
         });
 
@@ -701,7 +677,8 @@ router.post("/sdk/robots/:id/execute", requireAPIKey, async (req: AuthenticatedR
 
         logger.info(`[SDK] Starting execution for robot ${robotId}`);
 
-        const runSource = req.headers['x-run-source'] === 'cli' ? 'cli' : 'sdk';
+        const sourceHeader = req.headers['x-run-source'];
+        const runSource = sourceHeader === 'cli' || sourceHeader === 'mcp' ? sourceHeader : 'sdk';
         const promptInstructions = req.body?.promptInstructions;
         const requestedFormats = req.body?.formats as OutputFormats[] | undefined;
         
@@ -710,7 +687,14 @@ router.post("/sdk/robots/:id/execute", requireAPIKey, async (req: AuthenticatedR
             throw new Error('Failed to start robot execution');
         }
 
-        const run = await waitForRunCompletion(runId, user.id.toString());
+        // `wait: false` returns as soon as the run is queued; poll the run for its output.
+        if (req.body?.wait === false) {
+            return res.status(202).json({
+                data: { runId, status: 'running' }
+            });
+        }
+
+        const run = await waitForRunCompletion(runId);
 
         let listData: any[] = [];
         if (run.serializableOutput?.scrapeList) {
@@ -792,9 +776,11 @@ router.post("/sdk/robots/:id/execute", requireAPIKey, async (req: AuthenticatedR
             data: {
                 runId: run.runId,
                 status: run.status,
+                hasChanges: !!run.hasChanges,
+                changedFormats: (run.serializableOutput as any)?._comparison?.changedFormats || [],
                 data: {
-                    textData: run.serializableOutput?.scrapeSchema || {},
-                    listData: listData,
+                    textData: withSnakeCaseCapturedKeys(run.serializableOutput?.scrapeSchema || {}),
+                    listData: withSnakeCaseKeys(listData),
                     crawlData: crawlData,
                     searchData: searchData,
                     text: text,
@@ -848,15 +834,11 @@ async function waitForRunCompletion(runId: string, interval: number = 2000) {
  */
 router.get("/sdk/robots/:id/runs", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
         const robotId = req.params.id;
 
         const robot = await Robot.findOne({
             where: {
-                'recording_meta.id': robotId,
-                userId: req.user.id,
+                'recording_meta.id': robotId
             }
         });
 
@@ -874,7 +856,7 @@ router.get("/sdk/robots/:id/runs", requireAPIKey, async (req: AuthenticatedReque
         });
 
         return res.status(200).json({
-            data: runs
+            data: runs.map((run: any) => ({ ...run, serializableOutput: withSnakeCaseOutput(run.serializableOutput) }))
         });
     } catch (error: any) {
         logger.error("[SDK] Error getting runs:", error);
@@ -891,16 +873,12 @@ router.get("/sdk/robots/:id/runs", requireAPIKey, async (req: AuthenticatedReque
  */
 router.get("/sdk/robots/:id/runs/:runId", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
         const robotId = req.params.id;
         const runId = req.params.runId;
 
         const robot = await Robot.findOne({
             where: {
-                'recording_meta.id': robotId,
-                userId: req.user.id,
+                'recording_meta.id': robotId
             }
         });
 
@@ -923,8 +901,9 @@ router.get("/sdk/robots/:id/runs/:runId", requireAPIKey, async (req: Authenticat
             });
         }
 
+        const plainRun: any = run.toJSON();
         return res.status(200).json({
-            data: run
+            data: { ...plainRun, serializableOutput: withSnakeCaseOutput(plainRun.serializableOutput) }
         });
     } catch (error: any) {
         logger.error("[SDK] Error getting run:", error);
@@ -936,21 +915,88 @@ router.get("/sdk/robots/:id/runs/:runId", requireAPIKey, async (req: Authenticat
 });
 
 /**
+ * Get the stored monitoring diff for a run.
+ * GET /api/sdk/robots/:id/runs/:runId/diff
+ */
+router.get("/sdk/robots/:id/runs/:runId/diff", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        const robot = await Robot.findOne({ where: { 'recording_meta.id': req.params.id } });
+        if (!robot) return res.status(404).json({ error: "Robot not found" });
+
+        const run = await Run.findOne({
+            where: { runId: req.params.runId, robotMetaId: robot.recording_meta.id }
+        });
+        if (!run) return res.status(404).json({ error: "Run not found" });
+
+        const previousRun = await findPreviousSuccessfulRun(run);
+        if (!previousRun) {
+            return res.status(200).json({
+                data: { runId: run.runId, previousRunId: null, hasChanges: false, changedFormats: [], diffs: [] }
+            });
+        }
+
+        let changedFormats = ((run.serializableOutput as any)?._comparison?.changedFormats || []) as string[];
+        // Runs completed by older workers may have hasChanges persisted before
+        // their comparison metadata. Recompute it so their diffs remain usable.
+        if (run.hasChanges && changedFormats.length === 0) {
+            const robotType = (robot.recording_meta as any).type || (robot.recording_meta as any).robotType;
+            const comparison = robotType === 'extract'
+                ? await compareExtractRunWithPrevious(run, run.serializableOutput || {})
+                : await compareRunOutputsWithPrevious(run, run.serializableOutput || {});
+            changedFormats = comparison.changedFormats;
+            if (changedFormats.length > 0) {
+                await run.update({
+                    serializableOutput: {
+                        ...(run.serializableOutput || {}),
+                        _comparison: { changedFormats },
+                    },
+                });
+            }
+        }
+        const requestedFormat = typeof req.query.format === 'string' ? req.query.format : undefined;
+        const formats = requestedFormat ? changedFormats.filter((format) => format === requestedFormat) : changedFormats;
+        const content = (output: Record<string, any>, format: string): string => {
+            if (format === 'captured-text') return serializeCapturedText(output?.scrapeSchema);
+            if (format === 'captured-list') return JSON.stringify(JSON.parse(serializeCapturedLists(output?.scrapeList)), null, 2);
+            const value = output?.[format]?.[0]?.content;
+            return typeof value === 'string' ? value : '';
+        };
+
+        const diffs = formats.map((format) => ({
+            format,
+            changes: diffLines(
+                content(previousRun.serializableOutput || {}, format),
+                content(run.serializableOutput || {}, format),
+            ).map(({ value, added, removed }) => ({ value, added: Boolean(added), removed: Boolean(removed) })),
+        }));
+
+        return res.status(200).json({
+            data: {
+                runId: run.runId,
+                previousRunId: previousRun.runId,
+                hasChanges: Boolean(run.hasChanges),
+                changedFormats,
+                diffs,
+            }
+        });
+    } catch (error: any) {
+        logger.error("[SDK] Error getting run monitoring diff:", error);
+        return res.status(500).json({ error: "Failed to get run monitoring diff", message: error.message });
+    }
+});
+
+/**
  * Abort a running execution
  * POST /api/sdk/robots/:id/runs/:runId/abort
  */
 router.post("/sdk/robots/:id/runs/:runId/abort", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
         const robotId = req.params.id;
         const runId = req.params.runId;
 
         const robot = await Robot.findOne({
             where: {
-                'recording_meta.id': robotId,
-                userId: req.user.id,
+                'recording_meta.id': robotId
             }
         });
 
@@ -986,7 +1032,10 @@ router.post("/sdk/robots/:id/runs/:runId/abort", requireAPIKey, async (req: Auth
 
         return res.status(200).json({
             message: "Run abortion initiated",
-            data: run
+            data: (() => {
+                const plainRun: any = run.toJSON();
+                return { ...plainRun, serializableOutput: withSnakeCaseOutput(plainRun.serializableOutput) };
+            })()
         });
     } catch (error: any) {
         logger.error("[SDK] Error aborting run:", error);
@@ -1003,9 +1052,6 @@ router.post("/sdk/robots/:id/runs/:runId/abort", requireAPIKey, async (req: Auth
  */
 router.post("/sdk/robots/:id/duplicate", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
-        if (!req.user) {
-            return res.status(401).json({ error: 'Unauthorized' });
-        }
         const robotId = req.params.id;
         const { targetUrl } = req.body;
 
@@ -1031,7 +1077,7 @@ router.post("/sdk/robots/:id/duplicate", requireAPIKey, async (req: Authenticate
         }
 
         const originalRobot = await Robot.findOne({
-            where: { 'recording_meta.id': robotId, userId: req.user!.id }
+            where: { 'recording_meta.id': robotId }
         });
 
         if (!originalRobot) {
@@ -1130,6 +1176,7 @@ router.post("/sdk/crawl", requireAPIKey, async (req: AuthenticatedRequest, res: 
     try {
         const user = req.user;
         const { url, name, crawlConfig, formats } = req.body;
+        const llmConfigInput = readLlmConfig(req.body);
 
         if (!url || !crawlConfig) {
             return res.status(400).json({
@@ -1159,10 +1206,19 @@ router.post("/sdk/crawl", requireAPIKey, async (req: AuthenticatedRequest, res: 
             });
         }
 
-        // Crawl always needs formats; use defaults even if explicit empty array is provided
-        const crawlFormats: OutputFormats[] = requestedFormats.length > 0 
-            ? requestedFormats 
+        const crawlFormats: OutputFormats[] = requestedFormats.length > 0
+            ? requestedFormats
             : [...DEFAULT_OUTPUT_FORMATS];
+
+        if (formatsRequireLlm(crawlFormats)) {
+            const llmValidationError = validateRequiredLlmConfig(
+                llmConfigInput,
+                'The "summary" output format'
+            );
+            if (llmValidationError) {
+                return res.status(400).json(llmValidationError);
+            }
+        }
 
         const robotName = name || `Crawl Robot - ${new URL(normalizedUrl).hostname}`;
         const robotId = uuid();
@@ -1201,6 +1257,7 @@ router.post("/sdk/crawl", requireAPIKey, async (req: AuthenticatedRequest, res: 
                 type: 'crawl',
                 url: normalizedUrl,
                 formats: crawlFormats,
+                ...toPromptLlmMeta(llmConfigInput, encrypt),
             },
             recording: {
                 workflow: [
@@ -1267,6 +1324,7 @@ router.post("/sdk/search", requireAPIKey, async (req: AuthenticatedRequest, res:
     try {
         const user = req.user;
         const { name, searchConfig, formats } = req.body;
+        const llmConfigInput = readLlmConfig(req.body);
 
         if (!searchConfig) {
             return res.status(400).json({
@@ -1309,6 +1367,16 @@ router.post("/sdk/search", requireAPIKey, async (req: AuthenticatedRequest, res:
             searchConfig.mode = 'scrape';
         }
 
+        if (formatsRequireLlm(searchFormats) || formatsRequireLlm(searchConfig.outputFormats)) {
+            const llmValidationError = validateRequiredLlmConfig(
+                llmConfigInput,
+                'The "summary" output format'
+            );
+            if (llmValidationError) {
+                return res.status(400).json(llmValidationError);
+            }
+        }
+
         const robotName = name || `Search Robot - ${searchConfig.query}`;
         const robotId = uuid();
         const metaId = uuid();
@@ -1325,6 +1393,7 @@ router.post("/sdk/search", requireAPIKey, async (req: AuthenticatedRequest, res:
                 params: [],
                 type: 'search',
                 formats: searchFormats,
+                ...toPromptLlmMeta(llmConfigInput, encrypt),
             },
             recording: {
                 workflow: [
@@ -1372,29 +1441,31 @@ router.post("/sdk/search", requireAPIKey, async (req: AuthenticatedRequest, res:
 });
 
 /**
- * LLM-based extraction - generate workflow from natural language prompt
+ * AI Extract - generate a robot from a natural language prompt for one page
  * POST /api/sdk/extract/llm
- * URL is optional - if not provided, the system will search for the target website based on the prompt
+ * Both url and prompt are required; the robot extracts from that page only.
  */
 router.post("/sdk/extract/llm", requireAPIKey, async (req: AuthenticatedRequest, res: Response) => {
     try {
         const user = req.user
-        const { url, prompt, llmProvider, llmModel, llmApiKey, llmBaseUrl, robotName } = req.body;
-
-        if (!prompt) {
-            return res.status(400).json({
-                error: "Prompt is required"
-            });
+        const { url, prompt, llmProvider, llmModel, llmApiKey, llmBaseUrl, robotName, compareRuns } = req.body;
+        if (compareRuns !== undefined && typeof compareRuns !== 'boolean') {
+            return res.status(400).json({ error: 'compareRuns must be a boolean' });
         }
 
-        if (url) {
-            try {
-                normalizeRobotUrl(url);
-            } catch (err) {
-                return res.status(400).json({
-                    error: "Invalid URL format"
-                });
-            }
+        // The SDK has always accepted short prompts; only the URL requirement is new.
+        const input = checkAiExtractInput(url, prompt, { requireDetailedPrompt: false });
+        if (!input.ok) {
+            return res.status(400).json({ error: input.error });
+        }
+        const targetUrl = input.url;
+
+        const llmValidationError = validateRequiredLlmConfig(
+            readLlmConfig(req.body),
+            'Creating an LLM extract robot'
+        );
+        if (llmValidationError) {
+            return res.status(400).json(llmValidationError);
         }
 
         const llmConfig = {
@@ -1404,20 +1475,12 @@ router.post("/sdk/extract/llm", requireAPIKey, async (req: AuthenticatedRequest,
             baseUrl: llmBaseUrl
         };
 
-        let workflowResult: any;
-        let finalUrl: string;
+        const workflowResult = await WorkflowEnricher.generateWorkflowFromPrompt(targetUrl, input.prompt, user.id, llmConfig);
 
-        if (url) {
-            workflowResult = await WorkflowEnricher.generateWorkflowFromPrompt(url, prompt, user.id, llmConfig);
-            finalUrl = workflowResult.url || url;
-        } else {
-            workflowResult = await WorkflowEnricher.generateWorkflowFromPromptWithSearch(prompt, user.id, llmConfig);
-            finalUrl = workflowResult.url || '';
-        }
-
+        // 400 as before, so existing SDK clients keep handling generation failures the same way.
         if (!workflowResult.success || !workflowResult.workflow) {
             return res.status(400).json({
-                error: "Failed to generate workflow from prompt",
+                error: workflowResult.errors?.[0] || "Failed to generate workflow from prompt",
                 details: workflowResult.errors
             });
         }
@@ -1425,9 +1488,7 @@ router.post("/sdk/extract/llm", requireAPIKey, async (req: AuthenticatedRequest,
         const robotId = uuid();
         const metaId = uuid();
 
-        if (finalUrl) {
-            finalUrl = normalizeRobotUrl(finalUrl);
-        }
+        const finalUrl = targetUrl;
 
         const finalRobotName = robotName || `LLM Extract: ${prompt.substring(0, 50)}`;
 
@@ -1437,7 +1498,7 @@ router.post("/sdk/extract/llm", requireAPIKey, async (req: AuthenticatedRequest,
             const samePrompt = (meta.description || '') === prompt;
             const sameUrl = normalizeUrl(meta.url || '') === normalizeUrl(finalUrl);
 
-            if (samePrompt && sameUrl) {
+            if (samePrompt && sameUrl && Boolean(meta.compareRuns) === Boolean(compareRuns)) {
                 return res.status(200).json({
                     success: true,
                     data: {
@@ -1464,7 +1525,10 @@ router.post("/sdk/extract/llm", requireAPIKey, async (req: AuthenticatedRequest,
             params: [],
             type: 'extract',
             url: finalUrl,
-            isLLM: true
+            ...(compareRuns !== undefined ? { compareRuns } : {}),
+            isLLM: true,
+            // Spec, sample rows and fields not found on the page.
+            ...(workflowResult.aiExtract ? { aiExtract: workflowResult.aiExtract } : {}),
         };
 
         const robot = await Robot.create({
@@ -1478,8 +1542,10 @@ router.post("/sdk/extract/llm", requireAPIKey, async (req: AuthenticatedRequest,
 
         logger.info(`[SDK] Persistent robot created: ${metaId} for LLM extraction`);
 
+        // aiExtract holds rows scraped from the page; keep them out of telemetry.
+        const { aiExtract: _aiExtract, ...telemetryMeta } = robot.recording_meta as any;
         capture("maxun-oss-llm-robot-created", {
-            robot_meta: robot.recording_meta,
+            robot_meta: telemetryMeta,
             recording: robot.recording,
             prompt: prompt
         });
@@ -1498,6 +1564,192 @@ router.post("/sdk/extract/llm", requireAPIKey, async (req: AuthenticatedRequest,
         logger.error("[SDK] Error in LLM extraction:", error);
         return res.status(500).json({
             error: "Failed to perform LLM extraction",
+            message: error.message
+        });
+    }
+});
+
+/**
+ * Uploads for the document endpoints
+ */
+const documentUpload = multer({
+    storage: multer.memoryStorage(),
+    limits: { fileSize: MAX_FILE_SIZE_BYTES },
+    fileFilter: (_req, file, cb) => {
+        const allowedMimeTypes = [
+            'application/pdf',
+            'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            'text/csv',
+            'application/csv',
+            'image/jpeg',
+            'image/jpg',
+            'image/png',
+        ];
+        if (allowedMimeTypes.includes(file.mimetype)) {
+            cb(null, true);
+        } else {
+            cb(new Error('Only PDF, DOCX, XLSX, CSV, JPG, and PNG files are allowed'));
+        }
+    },
+});
+
+const DOC_PARSE_FORMATS: OutputFormats[] = ['markdown', 'html', 'links', 'summary'];
+
+/**
+ * Create a document extraction robot from an uploaded file
+ * POST /api/sdk/robots/document
+ */
+router.post("/sdk/robots/document", requireAPIKey, documentUpload.single('file'), async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        const user = req.user;
+        if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+        const file = (req as any).file as Express.Multer.File | undefined;
+        if (!file) return res.status(400).json({ error: 'A PDF, DOCX, XLSX, CSV, JPG, or PNG file is required' });
+
+        const prompt: string = (req.body.prompt || '').trim();
+        if (!prompt) return res.status(400).json({ error: 'prompt is required' });
+
+        const llmConfigInput = readLlmConfig(req.body);
+        const llmValidationError = validateRequiredLlmConfig(
+            llmConfigInput,
+            'Creating a document extract robot'
+        );
+        if (llmValidationError) {
+            return res.status(400).json(llmValidationError);
+        }
+
+        const robotName = (typeof req.body.robotName === 'string' ? req.body.robotName.trim() : '')
+            || `Document: ${prompt.substring(0, 50)}`;
+
+        const existingRobot = await findExistingRobotByName(robotName, user.id);
+        if (existingRobot) {
+            return res.status(409).json({
+                error: `A robot named "${robotName}" already exists. Please choose a different name.`
+            });
+        }
+
+        const { robot, extractionSchema } = await createDocumentRobotRecord({
+            documentBuffer: file.buffer,
+            documentMimeType: normalizeDocumentMimeType(file.mimetype, file.originalname) || PDF_MIME_TYPE,
+            originalFileName: file.originalname,
+            prompt,
+            robotName,
+            llmProvider: llmConfigInput.provider as 'anthropic' | 'openai' | 'ollama' | undefined,
+            llmModel: typeof llmConfigInput.model === 'string' ? llmConfigInput.model : undefined,
+            llmApiKey: typeof llmConfigInput.apiKey === 'string' ? llmConfigInput.apiKey : undefined,
+            llmBaseUrl: typeof llmConfigInput.baseUrl === 'string' ? llmConfigInput.baseUrl : undefined,
+            userId: user.id,
+        });
+
+        logger.info(`[SDK] Document robot created: ${robot.recording_meta?.id}`);
+
+        capture('maxun-oss-robot-created', {
+            robot_meta: robot.recording_meta,
+            robot_type: 'doc-extract',
+        });
+
+        return res.status(201).json({
+            success: true,
+            data: robot,
+            extractionSchema,
+        });
+    } catch (error: any) {
+        if (error.name === 'SequelizeUniqueConstraintError' || error.parent?.code === '23505') {
+            return res.status(409).json({ error: 'A robot with this name already exists.' });
+        }
+        logger.error(`[SDK] Error creating document robot: ${error.message}`);
+        return res.status(500).json({
+            error: 'Failed to create document robot',
+            message: error.message
+        });
+    }
+});
+
+/**
+ * Create a document parse robot from an uploaded file
+ * POST /api/sdk/robots/document-parse
+ *
+ * Parsing converts the document to markdown/html/links without an LLM, so no
+ * model configuration is required.
+ */
+router.post("/sdk/robots/document-parse", requireAPIKey, documentUpload.single('file'), async (req: AuthenticatedRequest, res: Response) => {
+    try {
+        const user = req.user;
+        if (!user) return res.status(401).json({ error: 'Unauthorized' });
+
+        const file = (req as any).file as Express.Multer.File | undefined;
+        if (!file) return res.status(400).json({ error: 'A PDF, DOCX, XLSX, CSV, JPG, or PNG file is required' });
+
+        const rawFormats = req.body['outputFormats[]'] ?? req.body.outputFormats ?? req.body.formats;
+        const requestedFormats: string[] = Array.isArray(rawFormats)
+            ? rawFormats
+            : (typeof rawFormats === 'string' ? [rawFormats] : []);
+
+        const invalidFormats = requestedFormats.filter((f) => !DOC_PARSE_FORMATS.includes(f as OutputFormats));
+        if (invalidFormats.length > 0) {
+            return res.status(400).json({
+                error: `Invalid formats: ${invalidFormats.join(', ')}. Document parse supports: ${DOC_PARSE_FORMATS.join(', ')}.`
+            });
+        }
+
+        const outputFormats: OutputFormats[] = requestedFormats.length > 0
+            ? (requestedFormats as OutputFormats[])
+            : [...DOC_PARSE_FORMATS];
+
+        const llmConfigInput = readLlmConfig(req.body);
+        if (formatsRequireLlm(outputFormats)) {
+            const llmValidationError = validateRequiredLlmConfig(
+                llmConfigInput,
+                'The "summary" output format'
+            );
+            if (llmValidationError) {
+                return res.status(400).json(llmValidationError);
+            }
+        }
+
+        const robotName = (typeof req.body.robotName === 'string' ? req.body.robotName.trim() : '')
+            || `Doc Parse: ${file.originalname}`;
+
+        const existingRobot = await findExistingRobotByName(robotName, user.id);
+        if (existingRobot) {
+            return res.status(409).json({
+                error: `A robot named "${robotName}" already exists. Please choose a different name.`
+            });
+        }
+
+        const { robot, parsedOutput } = await createDocumentParseRobotRecord({
+            documentBuffer: file.buffer,
+            documentMimeType: normalizeDocumentMimeType(file.mimetype, file.originalname) || PDF_MIME_TYPE,
+            originalFileName: file.originalname,
+            robotName,
+            outputFormats,
+            userId: user.id,
+            llmProvider: llmConfigInput.provider as 'anthropic' | 'openai' | 'ollama' | undefined,
+            llmModel: typeof llmConfigInput.model === 'string' ? llmConfigInput.model : undefined,
+            llmApiKey: typeof llmConfigInput.apiKey === 'string' ? llmConfigInput.apiKey : undefined,
+            llmBaseUrl: typeof llmConfigInput.baseUrl === 'string' ? llmConfigInput.baseUrl : undefined,
+        });
+
+        logger.info(`[SDK] Document parse robot created: ${robot.recording_meta?.id}`);
+
+        capture('maxun-oss-robot-created', {
+            robot_meta: robot.recording_meta,
+            robot_type: 'doc-parse',
+        });
+
+        return res.status(201).json({
+            success: true,
+            data: robot,
+        });
+    } catch (error: any) {
+        if (error.name === 'SequelizeUniqueConstraintError' || error.parent?.code === '23505') {
+            return res.status(409).json({ error: 'A robot with this name already exists.' });
+        }
+        logger.error(`[SDK] Error creating document parse robot: ${error.message}`);
+        return res.status(500).json({
+            error: 'Failed to create document parse robot',
             message: error.message
         });
     }

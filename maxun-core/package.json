@@ -1,12 +1,12 @@
 {
   "name": "maxun-core",
-  "version": "0.0.37",
+  "version": "0.0.38",
   "description": "Core package for Maxun, responsible for data extraction",
   "main": "build/index.js",
   "typings": "build/index.d.ts",
   "scripts": {
     "test": "jest",
-    "build": "npm run clean && tsc",
+    "build": "node init && npm run clean && tsc",
     "lint": "eslint .",
     "clean": "rimraf ./build"
   },

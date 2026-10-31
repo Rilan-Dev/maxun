@@ -1,7 +1,5 @@
 import React, { useState, useEffect } from 'react';
 import {
-    Alert,
-    AlertTitle,
     TextField,
     Button,
     Switch,
@@ -14,11 +12,15 @@ import {
     TableRow,
     TableBody,
     TableCell,
-    Paper
+    Paper,
+    CircularProgress
 } from '@mui/material';
 import { sendProxyConfig, getProxyConfig, testProxyConfig, deleteProxyConfig } from '../../api/proxy';
 import { useGlobalInfoStore } from '../../context/globalInfo';
 import { useTranslation } from 'react-i18next';
+
+const RECOMMENDED_PROXIES_STATUS_URL = 'https://docs.maxun.dev/proxy-sponsors-status.json';
+const RECOMMENDED_PROXIES_URL = 'https://docs.maxun.dev/byop#recommended-proxy-providers';
 
 const ProxyForm: React.FC = () => {
     const { t } = useTranslation();
@@ -35,6 +37,8 @@ const ProxyForm: React.FC = () => {
     });
     const [isProxyConfigured, setIsProxyConfigured] = useState(false);
     const [proxy, setProxy] = useState({ proxy_url: '', auth: false });
+    const [recommendedProxiesAvailable, setRecommendedProxiesAvailable] = useState(false);
+    const [isTesting, setIsTesting] = useState(false);
 
     const { notify } = useGlobalInfoStore();
 
@@ -87,6 +91,7 @@ const ProxyForm: React.FC = () => {
                 setIsProxyConfigured(true);
                 setProxy({ proxy_url: proxyConfigForm.server_url, auth: requiresAuth });
                 notify('success', t('proxy.notifications.config_success'));
+                // Refresh the masked config silently; the success toast above already covers this action
                 fetchProxyConfig();
             } else {
                 notify('error', t('proxy.notifications.config_error'));
@@ -98,22 +103,32 @@ const ProxyForm: React.FC = () => {
     };
 
     const testProxy = async () => {
-        await testProxyConfig().then((response) => {
+        if (isTesting) return;
+        setIsTesting(true);
+        try {
+            const response = await testProxyConfig();
             if (response.success) {
                 notify('success', t('proxy.notifications.test_success'));
             } else {
                 notify('error', t('proxy.notifications.test_error'));
             }
-        });
+        } catch (error: any) {
+            notify('error', t('proxy.notifications.test_error'));
+        } finally {
+            setIsTesting(false);
+        }
     };
 
-    const fetchProxyConfig = async () => {
+    // Only notifies when explicitly asked to, so loading the page stays silent
+    const fetchProxyConfig = async (showNotification: boolean = false) => {
         try {
             const response = await getProxyConfig();
             if (response.proxy_url) {
                 setIsProxyConfigured(true);
                 setProxy(response);
-                notify('success', t('proxy.notifications.fetch_success'));
+                if (showNotification) {
+                    notify('success', t('proxy.notifications.fetch_success'));
+                }
             }
         } catch (error: any) {
             notify('error', error);
@@ -132,8 +147,25 @@ const ProxyForm: React.FC = () => {
         });
     }
 
+    const checkRecommendedProxiesAvailability = async () => {
+        try {
+            const response = await fetch(RECOMMENDED_PROXIES_STATUS_URL, { cache: 'no-store' });
+            if (!response.ok) {
+                setRecommendedProxiesAvailable(false);
+                return;
+            }
+            const data = await response.json();
+            setRecommendedProxiesAvailable(Boolean(data?.available));
+        } catch (error) {
+            // Offline self-hosted instance, CORS issue, status file missing, etc.
+            // Fail closed — never show a link we can't confirm is live.
+            setRecommendedProxiesAvailable(false);
+        }
+    };
+
     useEffect(() => {
         fetchProxyConfig();
+        checkRecommendedProxiesAvailability();
     }, []);
 
     return (
@@ -153,6 +185,19 @@ const ProxyForm: React.FC = () => {
                 <Typography variant="h6" gutterBottom component="div">
                     {t('proxy.title')}
                 </Typography>
+                {recommendedProxiesAvailable && (
+                    <>
+                        <br />
+                        <a
+                            href={RECOMMENDED_PROXIES_URL}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ color: '#ff00c3', textDecoration: 'none', marginLeft: '3.6px' }}
+                        >
+                            Check out our recommended proxy providers with discounts specific for Maxun!
+                        </a>
+                    </>
+                )}
                 {
                     isProxyConfigured ? (
                         <Box sx={{ width: '100%', mt: 3 }}>
@@ -172,10 +217,22 @@ const ProxyForm: React.FC = () => {
                                     </TableBody>
                                 </Table>
                             </TableContainer>
-                            <Button variant="outlined" color="primary" onClick={testProxy}>
-                                {t('proxy.test_proxy')}
+                            <Button
+                                variant="outlined"
+                                color="primary"
+                                onClick={testProxy}
+                                disabled={isTesting}
+                                startIcon={isTesting ? <CircularProgress size={16} color="inherit" /> : null}
+                            >
+                                {isTesting ? t('proxy.testing') : t('proxy.test_proxy')}
                             </Button>
-                            <Button variant="outlined" color="error" onClick={removeProxy} sx={{ ml: 1 }}>
+                            <Button
+                                variant="outlined"
+                                color="error"
+                                onClick={removeProxy}
+                                disabled={isTesting}
+                                sx={{ ml: 1 }}
+                            >
                                 {t('proxy.remove_proxy')}
                             </Button>
                         </Box>
@@ -196,6 +253,14 @@ const ProxyForm: React.FC = () => {
                                         </span>
                                     }
                                 />
+                                <a
+                                    href="https://docs.maxun.dev/byop#authenticated-proxies"
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    style={{ fontSize: '0.8rem', color: '#ff00c3', textDecoration: 'none', marginLeft: '3.6px' }}
+                                >
+                                    Learn how to configure authenticated proxies here.
+                                </a>
                             </Box>
                             <Box sx={{ mb: 2 }}>
                                 <FormControlLabel
@@ -214,7 +279,11 @@ const ProxyForm: React.FC = () => {
                                             fullWidth
                                             required={requiresAuth}
                                             error={!!errors.username}
-                                            helperText={errors.username || ''}
+                                            helperText={
+                                                <span style={{ display: 'block', marginLeft: '-10px', marginTop: '5px' }}>
+                                                    {errors.username || t('proxy.username_hint')}
+                                                </span>
+                                            }
                                         />
                                     </Box>
                                     <Box sx={{ mb: 2 }}>
@@ -242,31 +311,7 @@ const ProxyForm: React.FC = () => {
                                 {t('proxy.add_proxy')}
                             </Button>
                         </Box>
-                   )}
-            </Box>
-         
-            <Box sx={{
-                flex: 1,
-                minWidth: 0,
-                maxWidth: 600,
-                mt: 4
-            }}>
-                <Alert severity="info" sx={{ height: 'auto', minHeight: 255 }}>
-                    <AlertTitle>{t('proxy.alert.title')}</AlertTitle>
-                    <br />
-                    <b>{t('proxy.alert.right_way')}</b>
-                    <br />
-                    {t('proxy.alert.proxy_url')} http://proxy.com:1337
-                    <br />
-                    {t('proxy.alert.username')} myusername
-                    <br />
-                    {t('proxy.alert.password')} mypassword
-                    <br />
-                    <br />
-                    <b>{t('proxy.alert.wrong_way')}</b>
-                    <br />
-                    {t('proxy.alert.proxy_url')} http://myusername:mypassword@proxy.com:1337
-                </Alert>
+                    )}
             </Box>
         </Box>
     );

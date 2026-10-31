@@ -2,7 +2,8 @@ import {
     Page,
     Browser,
     CDPSession,
-    BrowserContext
+    BrowserContext,
+    Response
 } from 'playwright-core';
 import { Socket } from "socket.io";
 import { PlaywrightBlocker } from '@cliqz/adblocker-playwright';
@@ -13,6 +14,7 @@ import { InterpreterSettings } from "../../types";
 import { WorkflowGenerator } from "../../workflow-management/classes/Generator";
 import { WorkflowInterpreter } from "../../workflow-management/classes/Interpreter";
 import { getDecryptedProxyConfig } from '../../routes/proxy';
+import { expandSessionPlaceholder, newProxySessionId } from '../../utils/proxy-session';
 import { getInjectableScript } from 'idcac-playwright';
 import { FingerprintInjector } from "fingerprint-injector";
 import { FingerprintGenerator } from "fingerprint-generator";
@@ -26,11 +28,10 @@ declare global {
   }
 }
 
-// const MEMORY_CONFIG = {
-//     gcInterval: 20000,
-//     maxHeapSize: 1536 * 1024 * 1024,
-//     heapUsageThreshold: 0.7
-// };
+interface PageNavigationState {
+    version: number;
+    queue: Promise<unknown>;
+}
 
 /**
  * This class represents a remote browser instance.
@@ -40,6 +41,14 @@ declare global {
  * @category BrowserManagement
  */
 export class RemoteBrowser {
+
+    /**
+     * Sticky proxy session id for this browser instance, generated lazily on
+     * first proxy use. Context relaunches inside initialize() reuse it, so they
+     * keep the same exit IP. A run that gets a new RemoteBrowser (e.g. a retried
+     * run) gets a new id.
+     */
+    private proxySessionId?: string;
 
     /**
      * Playwright's [browser](https://playwright.dev/docs/api/class-browser) instance.
@@ -86,6 +95,7 @@ export class RemoteBrowser {
     private userId: string;
 
     private lastEmittedUrl: string | null = null;
+    private pageNavigationStates = new WeakMap<Page, PageNavigationState>();
 
     /**
      * {@link WorkflowGenerator} instance specific to the remote browser.
@@ -123,54 +133,6 @@ export class RemoteBrowser {
         this.isRecordingMode = isRecordingMode;
     }
 
-    // private initializeMemoryManagement(): void {
-    //   this.memoryManagementInterval = setInterval(() => {
-    //     const memoryUsage = process.memoryUsage();
-    //     const heapUsageRatio = memoryUsage.heapUsed / MEMORY_CONFIG.maxHeapSize;
-
-    //     if (heapUsageRatio > MEMORY_CONFIG.heapUsageThreshold * 1.2) {
-    //       logger.warn(
-    //         "Critical memory pressure detected, triggering emergency cleanup"
-    //       );
-    //       this.performMemoryCleanup();
-    //     } else if (heapUsageRatio > MEMORY_CONFIG.heapUsageThreshold) {
-    //       logger.warn("High memory usage detected, triggering cleanup");
-
-    //       if (
-    //         global.gc &&
-    //         heapUsageRatio > MEMORY_CONFIG.heapUsageThreshold * 1.1
-    //       ) {
-    //         global.gc();
-    //       }
-    //     }
-    //   }, MEMORY_CONFIG.gcInterval);
-    // }
-
-    // private async performMemoryCleanup(): Promise<void> {
-    //   if (global.gc) {
-    //     try {
-    //       global.gc();
-    //       logger.info("Garbage collection requested");
-    //     } catch (error) {
-    //       logger.error("Error during garbage collection:", error);
-    //     }
-    //   }
-
-    //   if (this.currentPage) {
-    //     try {
-    //       await new Promise((resolve) => setTimeout(resolve, 500));
-    //       logger.info("CDP session reset completed");
-    //     } catch (error) {
-    //       logger.error("Error resetting CDP session:", error);
-    //     }
-    //   }
-
-    //   this.socket.emit("memory-cleanup", {
-    //     userId: this.userId,
-    //     timestamp: Date.now(),
-    //   });
-    // }
-
     /**
      * Normalizes URLs to prevent navigation loops while maintaining consistent format
      */
@@ -195,6 +157,50 @@ export class RemoteBrowser {
         const normalizedNew = this.normalizeUrl(newUrl);
         const normalizedLast = this.normalizeUrl(this.lastEmittedUrl);
         return normalizedNew !== normalizedLast;
+    }
+
+    private isNavigationContextError(error: any): boolean {
+        const message = error?.message || '';
+        return message.includes('Execution context was destroyed') ||
+            message.includes('Cannot find context with specified id') ||
+            message.includes('Target closed') ||
+            message.includes('Navigation failed because page was closed');
+    }
+
+    private getPageNavigationState(page: Page): PageNavigationState {
+        let state = this.pageNavigationStates.get(page);
+        if (!state) {
+            state = { version: 0, queue: Promise.resolve() };
+            this.pageNavigationStates.set(page, state);
+        }
+        return state;
+    }
+
+    public async navigateTo(
+        page: Page,
+        url: string,
+        options: Parameters<Page['goto']>[1] = {},
+    ): Promise<Response | null> {
+        const normalizedTarget = this.normalizeUrl(url);
+        const navigationState = this.getPageNavigationState(page);
+
+        const runNavigation = async (): Promise<Response | null> => {
+            if (page.isClosed()) {
+                throw new Error('Cannot navigate: page is closed');
+            }
+
+            if (this.normalizeUrl(page.url()) === normalizedTarget) {
+                logger.debug(`Skipping duplicate navigation to ${url}`);
+                return null;
+            }
+
+            navigationState.version++;
+            return page.goto(url, options);
+        };
+
+        const navigation = navigationState.queue.then(runNavigation, runNavigation);
+        navigationState.queue = navigation.catch(() => {});
+        return navigation;
     }
 
     /**
@@ -276,12 +282,23 @@ export class RemoteBrowser {
                 if (window.rrweb && window.isRecording) {
                   window.isRecording = false;
                 }
-              }).catch(() => {});
+              }).catch((error: any) => {
+                if (!this.isNavigationContextError(error)) {
+                  logger.warn(`[rrweb] Failed to stop previous recording: ${error?.message}`);
+                }
+              });
 
               if (this.isRecordingMode && !page.isClosed()) {
+                const navigationState = this.getPageNavigationState(page);
+                const navigationVersion = navigationState.version;
                 await page.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {
                   logger.warn('[rrweb] Network idle timeout on navigation, proceeding with rrweb initialization');
                 });
+
+                if (navigationVersion !== navigationState.version || page.isClosed()) {
+                  logger.debug('[rrweb] Skipping stale recording initialization after newer navigation');
+                  return;
+                }
 
                 await this.initializeRRWebRecording(page).catch((error: any) => {
                   logger.warn(`[rrweb] Failed to initialize recording on navigation: ${error?.message}`);
@@ -297,6 +314,8 @@ export class RemoteBrowser {
             try {
               const injectScript = async (): Promise<boolean> => {
                   try {
+                      const navigationState = this.getPageNavigationState(page);
+                      const navigationVersion = navigationState.version;
                       await page.waitForLoadState('networkidle', { timeout: 5000 });
 
                       if (page.isClosed()) {
@@ -304,9 +323,18 @@ export class RemoteBrowser {
                         return false;
                       }
 
+                      if (navigationVersion !== navigationState.version) {
+                        logger.debug('Skipping stale script injection after newer navigation');
+                        return false;
+                      }
+
                       await page.evaluate(getInjectableScript());
                       return true;
                   } catch (error: any) {
+                      if (this.isNavigationContextError(error)) {
+                        logger.log('debug', `Script injection skipped after navigation changed: ${error.message}`);
+                        return false;
+                      }
                       logger.log('warn', `Script injection attempt failed: ${error.message}`);
                       return false;
                   }
@@ -334,8 +362,15 @@ export class RemoteBrowser {
       try {
         const rrwebJsPath = require.resolve('rrweb/dist/rrweb.min.js');
         const rrwebScriptContent = readFileSync(rrwebJsPath, 'utf8');
+        const navigationState = this.getPageNavigationState(page);
+        const navigationVersion = navigationState.version;
 
         await page.context().addInitScript(rrwebScriptContent);
+
+        if (navigationVersion !== navigationState.version || page.isClosed()) {
+          logger.debug('[rrweb] Skipping stale script injection before evaluate');
+          return;
+        }
 
         await page.evaluate((scriptContent) => {
           if (typeof window.rrweb === 'undefined') {
@@ -346,6 +381,11 @@ export class RemoteBrowser {
             }
           }
         }, rrwebScriptContent);
+
+        if (navigationVersion !== navigationState.version || page.isClosed()) {
+          logger.debug('[rrweb] Skipping stale recording initialization after script injection');
+          return;
+        }
 
         const rrwebLoaded = await page.evaluate(() => typeof window.rrweb !== 'undefined');
         if (rrwebLoaded) {
@@ -416,10 +456,17 @@ export class RemoteBrowser {
           this.isDOMStreamingActive = true;
           this.emitLoadingProgress(80, 0);
           this.setupScrollEventListener();
+        } else if (rrwebStatus.error === 'already recording') {
+          logger.debug('[rrweb] Recording already active, skipping duplicate initialization');
+          this.isDOMStreamingActive = true;
         } else {
           logger.error(`Failed to initialize rrweb recording: ${rrwebStatus.error}`);
         }
       } catch (error: any) {
+        if (this.isNavigationContextError(error)) {
+          logger.debug(`[rrweb] Initialization skipped after navigation changed: ${error.message}`);
+          return;
+        }
         logger.error(`Failed to initialize rrweb recording: ${error.message}`);
       }
     }
@@ -493,10 +540,15 @@ export class RemoteBrowser {
               if (proxyConfig.proxy_url) {
                 proxyOptions = {
                   server: proxyConfig.proxy_url,
-                  ...(proxyConfig.proxy_username && proxyConfig.proxy_password && {
-                    username: proxyConfig.proxy_username,
-                    password: proxyConfig.proxy_password,
-                  }),
+                  ...(proxyConfig.proxy_username &&
+                    proxyConfig.proxy_password && {
+                      username:
+                        expandSessionPlaceholder(
+                          proxyConfig.proxy_username,
+                          (this.proxySessionId ??= newProxySessionId())
+                        ) ?? undefined,
+                      password: proxyConfig.proxy_password,
+                    }),
                 };
               }
 
@@ -742,16 +794,6 @@ export class RemoteBrowser {
      */
     public async switchOff(): Promise<void> {
       this.isDOMStreamingActive = false;
-
-      // if (this.memoryCleanupInterval) {
-      //   clearInterval(this.memoryCleanupInterval);
-      //   this.memoryCleanupInterval = null;
-      // }
-
-      // if (this.memoryManagementInterval) {
-      //   clearInterval(this.memoryManagementInterval);
-      //   this.memoryManagementInterval = null;
-      // }
 
       this.removeAllSocketListeners();
 
